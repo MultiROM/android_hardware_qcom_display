@@ -106,6 +106,90 @@ static int openFramebufferDevice(hwc_context_t *ctx)
     return 0;
 }
 
+static int ppdComm(const char* cmd, hwc_context_t *ctx) {
+    int ret = -1;
+    ret = send(ctx->mCablProp.daemon_socket, cmd, strlen(cmd), MSG_NOSIGNAL);
+    if(ret < 0) {
+        if (errno == EPIPE) {
+            //For broken pipe case, we will close the socket and
+            //re-establish the connection
+            close(ctx->mCablProp.daemon_socket);
+            int daemon_socket = socket_local_client(DAEMON_SOCKET,
+                    ANDROID_SOCKET_NAMESPACE_RESERVED,
+                    SOCK_STREAM);
+            if(!daemon_socket) {
+                ALOGE("Connecting to socket failed: %s", strerror(errno));
+                ctx->mCablProp.enabled = false;
+                return -1;
+            }
+            struct timeval timeout;
+            timeout.tv_sec = 1;//wait 1 second before timeout
+            timeout.tv_usec = 0;
+
+            if (setsockopt(daemon_socket, SOL_SOCKET, SO_SNDTIMEO,
+                        (char*)&timeout, sizeof(timeout )) < 0)
+                ALOGE("setsockopt failed");
+
+            ctx->mCablProp.daemon_socket = daemon_socket;
+            //resend the cmd after connection is re-established
+            ret = send(ctx->mCablProp.daemon_socket, cmd, strlen(cmd),
+                       MSG_NOSIGNAL);
+            if (ret < 0) {
+                ALOGE("Failed to send data over socket: %s",
+                        strerror(errno));
+                return ret;
+            }
+        } else {
+            ALOGE("Failed to send data over socket: %s",
+                    strerror(errno));
+            return ret;
+        }
+    }
+    ALOGD_IF(HWC_UTILS_DEBUG, "%s: Sent command: %s", __FUNCTION__, cmd);
+    return 0;
+}
+
+static void connectPPDaemon(hwc_context_t *ctx)
+{
+    int ret = -1;
+    char property[PROPERTY_VALUE_MAX];
+    if ((property_get("ro.qualcomm.cabl", property, NULL) > 0) &&
+        (atoi(property) == 1)) {
+        ALOGD("%s: CABL is enabled", __FUNCTION__);
+        ctx->mCablProp.enabled = true;
+    } else {
+        ALOGD("%s: CABL is disabled", __FUNCTION__);
+        ctx->mCablProp.enabled = false;
+        return;
+    }
+
+    if ((property_get("persist.qcom.cabl.video_only", property, NULL) > 0) &&
+        (atoi(property) == 1)) {
+        ALOGD("%s: CABL is in video only mode", __FUNCTION__);
+        ctx->mCablProp.videoOnly = true;
+    } else {
+        ctx->mCablProp.videoOnly = false;
+    }
+
+    int daemon_socket = socket_local_client(DAEMON_SOCKET,
+                                            ANDROID_SOCKET_NAMESPACE_RESERVED,
+                                            SOCK_STREAM);
+    if(!daemon_socket) {
+        ALOGE("Connecting to socket failed: %s", strerror(errno));
+        ctx->mCablProp.enabled = false;
+        return;
+    }
+    struct timeval timeout;
+    timeout.tv_sec = 1; //wait 1 second before timeout
+    timeout.tv_usec = 0;
+
+    if (setsockopt(daemon_socket, SOL_SOCKET, SO_SNDTIMEO,
+        (char*)&timeout, sizeof(timeout )) < 0)
+        ALOGE("setsockopt failed");
+
+    ctx->mCablProp.daemon_socket = daemon_socket;
+}
+
 void initContext(hwc_context_t *ctx)
 {
     if(openFramebufferDevice(ctx) < 0) {
@@ -167,6 +251,8 @@ void initContext(hwc_context_t *ctx)
 
     ALOGI("Initializing Qualcomm Hardware Composer");
     ALOGI("MDP version: %d", ctx->mMDP.version);
+
+    connectPPDaemon(ctx);
 }
 
 void closeContext(hwc_context_t *ctx)
@@ -312,21 +398,25 @@ bool isAlphaPresent(hwc_layer_1_t const* layer) {
     return false;
 }
 
-// Let CABL know we have a YUV layer
-static void setYUVProp(int yuvCount) {
-    static char property[PROPERTY_VALUE_MAX];
-    if(yuvCount > 0) {
-        if (property_get("hw.cabl.yuv", property, NULL) > 0) {
-            if (atoi(property) != 1) {
-                property_set("hw.cabl.yuv", "1");
-            }
-        }
-    } else {
-        if (property_get("hw.cabl.yuv", property, NULL) > 0) {
-            if (atoi(property) != 0) {
-                property_set("hw.cabl.yuv", "0");
-            }
-        }
+// Switch ppd on/off for YUV
+static void configurePPD(hwc_context_t *ctx, int yuvCount) {
+    if (!ctx->mCablProp.enabled)
+        return;
+
+    if (yuvCount > 0 && !ctx->mCablProp.start) {
+        ctx->mCablProp.start = true;
+        if(ctx->mCablProp.videoOnly)
+            ppdComm("cabl:on", ctx);
+        else
+            ppdComm("cabl:yuv_on", ctx);
+
+    } else if (yuvCount == 0 && ctx->mCablProp.start) {
+        ctx->mCablProp.start = false;
+        if(ctx->mCablProp.videoOnly)
+            ppdComm("cabl:off", ctx);
+        else
+            ppdComm("cabl:yuv_off", ctx);
+        return;
     }
 }
 
@@ -368,7 +458,8 @@ void setListStats(hwc_context_t *ctx,
         if(!ctx->listStats[dpy].needsAlphaScale)
             ctx->listStats[dpy].needsAlphaScale = isAlphaScaled(layer);
     }
-    setYUVProp(ctx->listStats[dpy].yuvCount);
+    if (dpy == HWC_DISPLAY_PRIMARY)
+        configurePPD(ctx, ctx->listStats[dpy].yuvCount);
 }
 
 
@@ -555,6 +646,9 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     int acquireFd[MAX_NUM_LAYERS];
     int count = 0;
     int releaseFd = -1;
+#ifndef TARGET_MAKO_JWR66
+    int retireFd = -1;
+#endif
     int fbFd = -1;
     int rotFd = -1;
     bool swapzero = false;
@@ -568,7 +662,9 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     }
     data.acq_fen_fd = acquireFd;
     data.rel_fen_fd = &releaseFd;
-
+#ifndef TARGET_MAKO_JWR66
+    data.retire_fen_fd = &retireFd;
+#endif
     char property[PROPERTY_VALUE_MAX];
     if(property_get("debug.egl.swapinterval", property, "1") > 0) {
         if(atoi(property) == 0)
@@ -667,14 +763,20 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         //Signals when MDP finishes reading rotator buffers.
         ctx->mLayerRotMap[dpy]->setReleaseFd(releaseFd);
     }
-
+#ifndef TARGET_MAKO_JWR66
+    close(releaseFd);
+    if(UNLIKELY(swapzero))
+        list->retireFenceFd = -1;
+    else
+        list->retireFenceFd = retireFd;
+#else
     if(UNLIKELY(swapzero)){
         list->retireFenceFd = -1;
         close(releaseFd);
     } else {
         list->retireFenceFd = releaseFd;
     }
-
+#endif
     return ret;
 }
 
@@ -850,7 +952,7 @@ int configureLowRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
     eTransform orient = static_cast<eTransform>(transform);
     int downscale = 0;
     int rotFlags = ovutils::ROT_FLAGS_NONE;
-    Whf whf(hnd->width, hnd->height,
+    Whf whf(getWidth(hnd), getHeight(hnd),
             getMdpFormat(hnd->format), hnd->size);
 
     if(isYuvBuffer(hnd) && ctx->mMDP.version >= qdutils::MDP_V4_2 &&
@@ -918,7 +1020,7 @@ int configureHighRes(hwc_context_t *ctx, hwc_layer_1_t *layer,
     const int downscale = 0;
     int rotFlags = ROT_FLAGS_NONE;
 
-    Whf whf(hnd->width, hnd->height,
+    Whf whf(getWidth(hnd), getHeight(hnd),
             getMdpFormat(hnd->format), hnd->size);
 
     setMdpFlags(layer, mdpFlagsL);
